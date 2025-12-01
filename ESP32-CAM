@@ -1,0 +1,426 @@
+// ESP32-CAM Congestion Detection with Edge Impulse - INTEGRATED VERSION
+#include <Fares-Magdy-project-1_inferencing.h>
+#include "edge-impulse-sdk/dsp/image/image.hpp"
+#include "esp_camera.h"
+#include "WiFi.h"
+#include "HTTPClient.h"
+
+// WiFi settings
+const char* ssid = "HighwayControl";
+const char* password = "12345678";
+
+// Camera model - using your exact configuration
+#define CAMERA_MODEL_AI_THINKER
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+/* Constant defines -------------------------------------------------------- */
+#define EI_CAMERA_RAW_FRAME_BUFFER_COLS           320
+#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS           240
+#define EI_CAMERA_FRAME_BYTE_SIZE                 3
+
+/* Private variables ------------------------------------------------------- */
+static bool debug_nn = false;
+static bool is_initialised = false;
+uint8_t *snapshot_buf; //points to the output of the capture
+
+static camera_config_t camera_config = {
+    .pin_pwdn = PWDN_GPIO_NUM,
+    .pin_reset = RESET_GPIO_NUM,
+    .pin_xclk = XCLK_GPIO_NUM,
+    .pin_sscb_sda = SIOD_GPIO_NUM,
+    .pin_sscb_scl = SIOC_GPIO_NUM,
+
+    .pin_d7 = Y9_GPIO_NUM,
+    .pin_d6 = Y8_GPIO_NUM,
+    .pin_d5 = Y7_GPIO_NUM,
+    .pin_d4 = Y6_GPIO_NUM,
+    .pin_d3 = Y5_GPIO_NUM,
+    .pin_d2 = Y4_GPIO_NUM,
+    .pin_d1 = Y3_GPIO_NUM,
+    .pin_d0 = Y2_GPIO_NUM,
+    .pin_vsync = VSYNC_GPIO_NUM,
+    .pin_href = HREF_GPIO_NUM,
+    .pin_pclk = PCLK_GPIO_NUM,
+
+    .xclk_freq_hz = 20000000,
+    .ledc_timer = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+
+    .pixel_format = PIXFORMAT_JPEG,
+    .frame_size = FRAMESIZE_QVGA,
+    .jpeg_quality = 12,
+    .fb_count = 1,
+    .fb_location = CAMERA_FB_IN_PSRAM,
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+};
+
+// Congestion detection variables
+int totalCarsDetected = 0;
+int congestionThreshold = 2; // 2+ cars = congestion
+bool congestionActive = false;
+unsigned long lastDetectionTime = 0;
+
+void setup() {
+    Serial.begin(115200);
+    Serial.setDebugOutput(true);
+    Serial.println();
+    Serial.println("=== ESP32-CAM Edge Impulse Congestion Detection ===");
+    
+    // Initialize camera using your working code
+    if (ei_camera_init() == false) {
+        Serial.println("Failed to initialize Camera!");
+        while (true) delay(1000);
+    }
+    else {
+        Serial.println("Camera initialized successfully!");
+    }
+
+    // Connect to WiFi
+    setupWiFi();
+    
+    Serial.println("Edge Impulse Congestion Detection System Ready!");
+    Serial.printf("Congestion threshold: %d+ cars\n", congestionThreshold);
+    Serial.println("Connected to Highway Control System");
+    
+    ei_printf("\nStarting congestion detection in 2 seconds...\n");
+    ei_sleep(2000);
+}
+
+void loop() {
+    detectCongestionWithEI();
+    delay(3000); // Check every 3 seconds
+}
+
+void setupWiFi() {
+    Serial.printf("Connecting to %s", ssid);
+    WiFi.begin(ssid, password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    Serial.println();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("WiFi Connected!");
+        Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("WiFi Connection Failed!");
+    }
+}
+
+void detectCongestionWithEI() {
+    snapshot_buf = (uint8_t*)malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE);
+
+    // check if allocation was successful
+    if(snapshot_buf == nullptr) {
+        Serial.println("ERR: Failed to allocate snapshot buffer!");
+        return;
+    }
+
+    ei::signal_t signal;
+    signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+    signal.get_data = &ei_camera_get_data;
+
+    if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf) == false) {
+        Serial.println("Failed to capture image\r\n");
+        free(snapshot_buf);
+        return;
+    }
+
+    // Run the classifier
+    ei_impulse_result_t result = { 0 };
+
+    EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
+    if (err != EI_IMPULSE_OK) {
+        Serial.printf("ERR: Failed to run classifier (%d)\n", err);
+        free(snapshot_buf);
+        return;
+    }
+
+    // Process the results for congestion detection
+    processEIResultsForCongestion(&result);
+
+    free(snapshot_buf);
+}
+
+void processEIResultsForCongestion(ei_impulse_result_t *result) {
+    // Reset car count
+    totalCarsDetected = 0;
+    
+    Serial.println("🤖 Edge Impulse Results:");
+
+#if EI_CLASSIFIER_OBJECT_DETECTION == 1
+    // Object detection model - count bounding boxes
+    Serial.printf("Object detection - Found %d potential object(s)\n", result->bounding_boxes_count);
+    
+    for (uint32_t i = 0; i < result->bounding_boxes_count; i++) {
+        ei_impulse_result_bounding_box_t bb = result->bounding_boxes[i];
+        if (bb.value == 0) {
+            continue;
+        }
+        
+        Serial.printf("  🎯 %s: %.2f [x: %u, y: %u, w: %u, h: %u]\n",
+                bb.label, bb.value, bb.x, bb.y, bb.width, bb.height);
+        
+        // Check if this is one of your colored cars with sufficient confidence
+        if (bb.value > 0.6) { // 60% confidence threshold
+            if (isCarDetection(bb.label)) {
+                totalCarsDetected++;
+                Serial.printf("COUNTED as car: %s (%.1f%% confidence)\n", bb.label, bb.value * 100);
+            }
+        }
+    }
+
+#else
+    // Classification model - find the highest confidence class
+    Serial.println("Classification results:");
+    float max_confidence = 0.0;
+    const char* max_label = "unknown";
+    
+    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        float confidence = result->classification[i].value;
+        const char* label = ei_classifier_inferencing_categories[i];
+        
+        Serial.printf("  %s: %.5f\n", label, confidence);
+        
+        if (confidence > max_confidence) {
+            max_confidence = confidence;
+            max_label = label;
+        }
+    }
+    
+    // If the detected object is a car with good confidence, count it
+    if (max_confidence > 0.6 && isCarDetection(max_label)) {
+        totalCarsDetected = 1;
+        Serial.printf("Detected: %s (%.1f%% confidence)\n", max_label, max_confidence * 100);
+    }
+#endif
+
+    // Print anomaly result (if it exists)
+#if EI_CLASSIFIER_HAS_ANOMALY
+    Serial.printf("Anomaly prediction: %.3f\n", result->anomaly);
+#endif
+
+    // Process congestion based on car count
+    processCongestionResults();
+}
+
+bool isCarDetection(const char* label) {
+    // Check if the label corresponds to one of your car classes
+    return (strstr(label, "car") != NULL || 
+            strstr(label, "white") != NULL ||
+            strstr(label, "yellow") != NULL ||
+            strstr(label, "green") != NULL ||
+            strstr(label, "black") != NULL ||
+            strstr(label, "vehicle") != NULL);
+}
+
+void processCongestionResults() {
+    bool previousCongestion = congestionActive;
+    congestionActive = (totalCarsDetected >= congestionThreshold);
+    
+    displayCongestionAnalysis();
+    
+    // Only send update if congestion state changed
+    if (congestionActive != previousCongestion) {
+        if (congestionActive) {
+            Serial.println("CONGESTION DETECTED! Activating measures...");
+        } else {
+            Serial.println("Congestion cleared. Returning to normal...");
+        }
+        
+        sendCongestionAlert();
+    }
+    
+    lastDetectionTime = millis();
+}
+
+void displayCongestionAnalysis() {
+    Serial.println("\n=== EDGE IMPULSE CONGESTION ANALYSIS ===");
+    Serial.printf("Cars Detected: %d\n", totalCarsDetected);
+    Serial.printf("Congestion Threshold: %d+ cars\n", congestionThreshold);
+    Serial.printf("Congestion Status: %s\n", congestionActive ? "ACTIVE 🚨" : "INACTIVE 🟢");
+    Serial.printf("Congestion Level: %d/3\n", getCongestionLevel());
+    
+    // Traffic analysis
+    if (totalCarsDetected == 0) {
+        Serial.println("No cars detected - Road empty");
+    } else if (totalCarsDetected == 1) {
+        Serial.println("Single car - Normal traffic flow");
+    } else if (totalCarsDetected == 2) {
+        Serial.println("Two cars - Light congestion");
+    } else if (totalCarsDetected == 3) {
+        Serial.println("Three cars - Moderate congestion");
+    } else {
+        Serial.println("Multiple cars - Heavy congestion!");
+    }
+    
+    // Action recommendation
+    if (congestionActive) {
+        Serial.println("ACTION: Activate congestion measures");
+    } else {
+        Serial.println("STATUS: Normal operation");
+    }
+    
+    Serial.println("==========================================\n");
+}
+
+int getCongestionLevel() {
+    if (totalCarsDetected >= 4) return 3; // Heavy congestion
+    if (totalCarsDetected >= 3) return 2; // Moderate congestion
+    if (totalCarsDetected >= 2) return 1; // Light congestion
+    return 0; // No congestion
+}
+
+void sendCongestionAlert() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("❌ Not connected to WiFi - cannot send alert");
+        return;
+    }
+    
+    HTTPClient http;
+    WiFiClient client;
+    
+    String serverURL = "http://192.168.4.1/congestion";
+    
+    Serial.println("📤 Sending congestion alert to highway system...");
+    
+    if (http.begin(client, serverURL)) {
+        http.addHeader("Content-Type", "application/json");
+        
+        String jsonData = "{";
+        jsonData += "\"vehicle_count\":" + String(totalCarsDetected) + ",";
+        jsonData += "\"congestion\":" + String(congestionActive ? "true" : "false") + ",";
+        jsonData += "\"congestion_level\":" + String(getCongestionLevel()) + ",";
+        jsonData += "\"detection_type\":\"edge_impulse_ai\"";
+        jsonData += "}";
+        
+        Serial.printf("Data: %s\n", jsonData.c_str());
+        
+        int httpResponseCode = http.POST(jsonData);
+        
+        if (httpResponseCode > 0) {
+            Serial.printf("Alert sent successfully! Response: %d\n", httpResponseCode);
+        } else {
+            Serial.printf("Failed to send alert. Error: %s\n", http.errorToString(httpResponseCode).c_str());
+        }
+        
+        http.end();
+    } else {
+        Serial.println("Failed to connect to highway server");
+    }
+}
+
+// Your original Edge Impulse camera functions (unchanged)
+bool ei_camera_init(void) {
+    if (is_initialised) return true;
+
+    //initialize the camera
+    esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK) {
+      Serial.printf("Camera init failed with error 0x%x\n", err);
+      return false;
+    }
+
+    sensor_t * s = esp_camera_sensor_get();
+    if (s->id.PID == OV3660_PID) {
+      s->set_vflip(s, 1);
+      s->set_brightness(s, 1);
+      s->set_saturation(s, 0);
+    }
+
+    is_initialised = true;
+    return true;
+}
+
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
+    bool do_resize = false;
+
+    if (!is_initialised) {
+        Serial.println("ERR: Camera is not initialized\r\n");
+        return false;
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.println("Camera capture failed\n");
+        return false;
+    }
+
+   bool converted = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
+   esp_camera_fb_return(fb);
+
+   if(!converted){
+       Serial.println("Conversion failed\n");
+       return false;
+   }
+
+    if ((img_width != EI_CAMERA_RAW_FRAME_BUFFER_COLS)
+        || (img_height != EI_CAMERA_RAW_FRAME_BUFFER_ROWS)) {
+        do_resize = true;
+    }
+
+    if (do_resize) {
+        ei::image::processing::crop_and_interpolate_rgb888(
+        out_buf,
+        EI_CAMERA_RAW_FRAME_BUFFER_COLS,
+        EI_CAMERA_RAW_FRAME_BUFFER_ROWS,
+        out_buf,
+        img_width,
+        img_height);
+    }
+
+    return true;
+}
+
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
+    size_t pixel_ix = offset * 3;
+    size_t pixels_left = length;
+    size_t out_ptr_ix = 0;
+
+    while (pixels_left != 0) {
+        out_ptr[out_ptr_ix] = (snapshot_buf[pixel_ix + 2] << 16) + (snapshot_buf[pixel_ix + 1] << 8) + snapshot_buf[pixel_ix];
+        out_ptr_ix++;
+        pixel_ix+=3;
+        pixels_left--;
+    }
+    return 0;
+}
+
+#if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_CAMERA
+#error "Invalid model for current sensor"
+#endif
+
+// Utility functions
+void setCongestionThreshold(int threshold) {
+    congestionThreshold = threshold;
+    Serial.printf("Congestion threshold set to: %d cars\n", threshold);
+}
+
+void printSystemStatus() {
+    Serial.println("\n=== EDGE IMPULSE SYSTEM STATUS ===");
+    Serial.printf("Cars detected: %d\n", totalCarsDetected);
+    Serial.printf("Congestion active: %s\n", congestionActive ? "YES" : "NO");
+    Serial.printf("Congestion threshold: %d cars\n", congestionThreshold);
+    Serial.printf("WiFi status: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.println("=================================\n");
+}
