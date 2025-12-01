@@ -1,0 +1,197 @@
+// Highway Green Corridor System - Upload to ESP32-S3
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+
+// WiFi Settings
+const char* ssid = "HighwayControl";
+const char* password = "12345678";
+  
+WebServer server(80);
+
+// System States
+String systemMode = "NORMAL";
+bool emergencyVehicleApproaching = false;
+bool congestionDetected = false;
+unsigned long modeStartTime = 0;
+
+// Highway Section Coordinates (set your actual coordinates)
+const float HIGHWAY_START_LAT = 30.0444;
+const float HIGHWAY_START_LON = 31.2357;
+const float HIGHWAY_END_LAT = 30.0500;
+const float HIGHWAY_END_LON = 31.2400;
+
+// Congestion detection
+int vehicleCount = 0;
+int congestionThreshold = 10;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); // Add this delay
+  Serial.println("\n\n=== HIGHWAY GREEN CORRIDOR SYSTEM ===");
+  
+  setupWiFi();
+  setupWebServer();
+  
+  Serial.println("=== HIGHWAY GREEN CORRIDOR SYSTEM ===");
+  Serial.println("Monitoring for congestion & emergency vehicles");
+  Serial.print("System IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void loop() {
+  server.handleClient();
+  checkCongestion();
+  checkEmergencyVehicle();
+  updateCorridorControl();
+  delay(100);
+}
+
+void setupWiFi() {
+  WiFi.softAP(ssid, password);
+}
+
+void setupWebServer() {
+  server.on("/emergency", HTTP_POST, []() {
+    String body = server.arg("plain");
+    processEmergencyVehicle(body);
+    server.send(200, "application/json", "{\"status\":\"received\"}");
+  });
+  
+  server.on("/congestion", HTTP_POST, []() {
+    String body = server.arg("plain");
+    processCongestionData(body);
+    server.send(200, "application/json", "{\"status\":\"received\"}");
+  });
+  
+  server.on("/status", HTTP_GET, []() {
+    server.send(200, "application/json", getSystemStatus());
+  });
+
+  server.on("/test", HTTP_GET, []() {
+    server.send(200, "application/json", "{\"message\":\"Highway system is running!\"}");
+  });
+  
+  server.begin();
+}
+
+void processEmergencyVehicle(String vehicleData) {
+  Serial.println("🚨 Received emergency vehicle data:");
+  Serial.println(vehicleData);
+  
+  DynamicJsonDocument doc(1024);
+  deserializeJson(doc, vehicleData);
+  
+  float lat = doc["latitude"];
+  float lon = doc["longitude"];
+  float speed = doc["speed"];
+  bool emergency = doc["emergency"];
+  
+  if (emergency) {
+    emergencyVehicleApproaching = true;
+    modeStartTime = millis();
+    systemMode = "EMERGENCY_CORRIDOR";
+    
+    Serial.println("🚨 EMERGENCY VEHICLE DETECTED!");
+    Serial.println("🟢 OPENING GREEN CORRIDOR");
+    
+    activateGreenCorridor();
+  }
+}
+
+void processCongestionData(String congestionData) {
+  Serial.println("🚗 Received congestion data:");
+  Serial.println(congestionData);
+  
+  DynamicJsonDocument doc(512);
+  deserializeJson(doc, congestionData);
+  
+  vehicleCount = doc["vehicle_count"];
+  congestionDetected = doc["congestion"];
+  
+  if (congestionDetected && !emergencyVehicleApproaching) {
+    systemMode = "CONGESTION_RELIEF";
+    modeStartTime = millis();
+    
+    Serial.println("🚗 CONGESTION DETECTED!");
+    Serial.print("Vehicle count: "); Serial.println(vehicleCount);
+    Serial.println("🟢 ACTIVATING CONGESTION RELIEF LANE");
+    
+    activateCongestionRelief();
+  }
+}
+
+void checkCongestion() {
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 5000) {
+    lastCheck = millis();
+    
+    // Simulate random congestion for testing
+    if (random(0, 100) > 80) {
+      congestionDetected = true;
+      vehicleCount = random(15, 25);
+      Serial.println("🧪 SIMULATION: Congestion detected");
+    } else {
+      congestionDetected = false;
+      vehicleCount = random(5, 12);
+    }
+  }
+}
+
+void checkEmergencyVehicle() {
+  if (emergencyVehicleApproaching) {
+    unsigned long currentTime = millis();
+    unsigned long modeDuration = (currentTime - modeStartTime) / 1000;
+    
+    if (modeDuration > 120) {
+      emergencyVehicleApproaching = false;
+      systemMode = congestionDetected ? "CONGESTION_RELIEF" : "NORMAL";
+      Serial.println("🟢 Emergency corridor closed");
+    }
+  }
+}
+
+void updateCorridorControl() {
+  if (systemMode == "EMERGENCY_CORRIDOR") {
+    // Emergency corridor active
+  } else if (systemMode == "CONGESTION_RELIEF") {
+    unsigned long currentTime = millis();
+    unsigned long modeDuration = (currentTime - modeStartTime) / 1000;
+    
+    if (modeDuration > 180 && !congestionDetected) {
+      systemMode = "NORMAL";
+      Serial.println("🟡 Returning to normal operation");
+    }
+  }
+}
+
+void activateGreenCorridor() {
+  Serial.println("=== GREEN CORRIDOR ACTIVATED ===");
+  Serial.println("1. Clearing fast lane vehicles");
+  Serial.println("2. Activating emergency lane signals");
+  Serial.println("3. Coordinating with adjacent sections");
+  Serial.println("=================================");
+}
+
+void activateCongestionRelief() {
+  Serial.println("=== CONGESTION RELIEF ACTIVATED ===");
+  Serial.println("1. Opening additional lane");
+  Serial.println("2. Adjusting speed limits");
+  Serial.println("3. Managing traffic flow");
+  Serial.println("===================================");
+}
+
+String getSystemStatus() {
+  DynamicJsonDocument doc(1024);
+  
+  doc["system"] = "Highway Green Corridor";
+  doc["mode"] = systemMode;
+  doc["congestion"] = congestionDetected;
+  doc["vehicle_count"] = vehicleCount;
+  doc["emergency_vehicle"] = emergencyVehicleApproaching;
+  doc["congestion_threshold"] = congestionThreshold;
+  
+  String output;
+  serializeJson(doc, output);
+  return output;
+}
