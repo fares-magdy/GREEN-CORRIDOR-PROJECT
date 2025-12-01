@@ -1,0 +1,347 @@
+// Emergency Vehicle with Mobile Web Control
+// Connect to WiFi and open web page to control
+
+#include <TinyGPS++.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// Motor Control Pins
+#define MOTOR_A_IN1 3  // Right motor forward
+#define MOTOR_A_IN2 2  // Right motor backward
+#define MOTOR_B_IN3 0  // Left motor forward
+#define MOTOR_B_IN4 4  // Left motor backward
+
+// GPS Pins
+#define GPS_TX 8   // GPS TXD -> ESP32 RX
+#define GPS_RX 9   // GPS RXD -> ESP32 TX
+
+// WiFi Settings
+const char* ssid = "EmergencyVehicle";
+const char* password = "12345678";
+
+// Web Server
+WebServer server(80);
+
+// GPS
+TinyGPSPlus gps;
+
+// Motor control variables
+int speed = 200; // PWM speed (0-255)
+String vehicleStatus = "Ready";
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize motor pins
+  pinMode(MOTOR_A_IN1, OUTPUT);
+  pinMode(MOTOR_A_IN2, OUTPUT);
+  pinMode(MOTOR_B_IN3, OUTPUT);
+  pinMode(MOTOR_B_IN4, OUTPUT);
+  
+  // Initialize GPS
+  Serial1.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  
+  // Setup WiFi
+  setupWiFi();
+  
+  // Setup Web Server
+  setupWebServer();
+  
+  // Stop motors initially
+  stopMotors();
+  
+  Serial.println("=== EMERGENCY VEHICLE MOBILE CONTROL ===");
+  Serial.print("Connect to WiFi: ");
+  Serial.println(ssid);
+  Serial.print("Then open: http://");
+  Serial.println(WiFi.softAPIP());
+  Serial.println("Ready for mobile commands!");
+}
+
+void loop() {
+  server.handleClient(); // Handle web requests
+  readGPS(); // Read GPS data
+  delay(10);
+}
+
+void setupWiFi() {
+  WiFi.softAP(ssid, password);
+  Serial.print("Access Point IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void setupWebServer() {
+  // Serve the control page
+  server.on("/", HTTP_GET, []() {
+    String html = createControlPage();
+    server.send(200, "text/html", html);
+  });
+  
+  // Handle control commands
+  server.on("/control", HTTP_GET, []() {
+    String command = server.arg("cmd");
+    executeCommand(command.charAt(0));
+    
+    String response = "{\"status\":\"OK\", \"message\":\"" + vehicleStatus + "\"}";
+    server.send(200, "application/json", response);
+  });
+  
+  // Get vehicle status
+  server.on("/status", HTTP_GET, []() {
+    String gpsInfo = "No GPS";
+    if (gps.location.isValid()) {
+      gpsInfo = String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
+    }
+    
+    String response = "{\"status\":\"" + vehicleStatus + 
+                     "\", \"gps\":\"" + gpsInfo + 
+                     "\", \"speed\":\"" + String(speed) + "\"}";
+    server.send(200, "application/json", response);
+  });
+  
+  server.begin();
+}
+
+String createControlPage() {
+  String html = R"rawliteral(
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <title>Emergency Vehicle Control</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body { 
+        font-family: Arial; 
+        text-align: center; 
+        background: #f0f0f0;
+        margin: 0;
+        padding: 20px;
+      }
+      .container {
+        max-width: 400px;
+        margin: 0 auto;
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+      }
+      .control-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 10px;
+        margin: 20px 0;
+      }
+      button {
+        padding: 20px;
+        font-size: 18px;
+        border: none;
+        border-radius: 8px;
+        background: #007bff;
+        color: white;
+        cursor: pointer;
+      }
+      button:active { background: #0056b3; }
+      .forward { grid-column: 2; background: #28a745; }
+      .forward:active { background: #1e7e34; }
+      .backward { grid-column: 2; background: #dc3545; }
+      .backward:active { background: #c82333; }
+      .left { grid-column: 1; background: #ffc107; color: black; }
+      .right { grid-column: 3; background: #ffc107; color: black; }
+      .stop { grid-column: 1 / span 3; background: #6c757d; }
+      .speed-btn { background: #17a2b8; }
+      .status {
+        background: #e9ecef;
+        padding: 10px;
+        border-radius: 5px;
+        margin: 10px 0;
+        font-family: monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>🚑 Emergency Vehicle Control</h1>
+      
+      <div class="status" id="status">
+        Loading vehicle status...
+      </div>
+      
+      <div class="control-grid">
+        <button class="forward" onclick="sendCommand('F')">↑ FORWARD</button>
+        <button class="left" onclick="sendCommand('L')">← LEFT</button>
+        <button class="right" onclick="sendCommand('R')">RIGHT →</button>
+        <button class="backward" onclick="sendCommand('B')">↓ BACKWARD</button>
+        <button class="stop" onclick="sendCommand('S')">🛑 STOP</button>
+      </div>
+      
+      <div style="margin: 20px 0;">
+        <button class="speed-btn" onclick="sendCommand('1')">SLOW</button>
+        <button class="speed-btn" onclick="sendCommand('2')">MEDIUM</button>
+        <button class="speed-btn" onclick="sendCommand('3')">FAST</button>
+        <button onclick="sendCommand('G')">📍 GPS</button>
+        <button onclick="sendCommand('T')">🧪 TEST</button>
+      </div>
+      
+      <script>
+        function sendCommand(cmd) {
+          fetch('/control?cmd=' + cmd)
+            .then(response => response.json())
+            .then(data => {
+              updateStatus(data.message);
+            });
+        }
+        
+        function updateStatus(message) {
+          document.getElementById('status').innerHTML = 
+            '<strong>Status:</strong> ' + message + '<br>' +
+            document.getElementById('status').innerHTML.split('<br>').slice(0,2).join('<br>');
+        }
+        
+        function updateVehicleStatus() {
+          fetch('/status')
+            .then(response => response.json())
+            .then(data => {
+              let gpsInfo = data.gps === 'No GPS' ? 'No GPS signal' : 'GPS: ' + data.gps;
+              document.getElementById('status').innerHTML = 
+                '<strong>Status:</strong> ' + data.status + '<br>' +
+                '<strong>Speed:</strong> ' + data.speed + '<br>' +
+                '<strong>' + gpsInfo + '</strong>';
+            });
+        }
+        
+        // Update status every 2 seconds
+        setInterval(updateVehicleStatus, 2000);
+        updateVehicleStatus();
+      </script>
+    </div>
+  </body>
+  </html>
+  )rawliteral";
+  
+  return html;
+}
+
+void executeCommand(char command) {
+  switch(command) {
+    case 'F': // Forward
+      moveForward();
+      vehicleStatus = "Moving FORWARD";
+      break;
+      
+    case 'B': // Backward
+      moveBackward();
+      vehicleStatus = "Moving BACKWARD";
+      break;
+      
+    case 'L': // Left
+      turnLeft();
+      vehicleStatus = "Turning LEFT";
+      break;
+      
+    case 'R': // Right
+      turnRight();
+      vehicleStatus = "Turning RIGHT";
+      break;
+      
+    case 'S': // Stop
+      stopMotors();
+      vehicleStatus = "STOPPED";
+      break;
+      
+    case '1': // Speed 1 (Slow)
+      speed = 150;
+      vehicleStatus = "Speed: SLOW";
+      break;
+      
+    case '2': // Speed 2 (Medium)
+      speed = 200;
+      vehicleStatus = "Speed: MEDIUM";
+      break;
+      
+    case '3': // Speed 3 (Fast)
+      speed = 255;
+      vehicleStatus = "Speed: FAST";
+      break;
+      
+    case 'G': // Get GPS
+      sendGPSData();
+      return;
+      
+    case 'T': // Test sequence
+      testSequence();
+      return;
+  }
+  
+  Serial.println(vehicleStatus);
+}
+
+void moveForward() {
+  analogWrite(MOTOR_A_IN1, speed);
+  analogWrite(MOTOR_A_IN2, 0);
+  analogWrite(MOTOR_B_IN3, speed);
+  analogWrite(MOTOR_B_IN4, 0);
+}
+
+void moveBackward() {
+  analogWrite(MOTOR_A_IN1, 0);
+  analogWrite(MOTOR_A_IN2, speed);
+  analogWrite(MOTOR_B_IN3, 0);
+  analogWrite(MOTOR_B_IN4, speed);
+}
+
+void turnLeft() {
+  analogWrite(MOTOR_A_IN1, speed);
+  analogWrite(MOTOR_A_IN2, 0);
+  analogWrite(MOTOR_B_IN3, 0);
+  analogWrite(MOTOR_B_IN4, speed);
+}
+
+void turnRight() {
+  analogWrite(MOTOR_A_IN1, 0);
+  analogWrite(MOTOR_A_IN2, speed);
+  analogWrite(MOTOR_B_IN3, speed);
+  analogWrite(MOTOR_B_IN4, 0);
+}
+
+void stopMotors() {
+  analogWrite(MOTOR_A_IN1, 0);
+  analogWrite(MOTOR_A_IN2, 0);
+  analogWrite(MOTOR_B_IN3, 0);
+  analogWrite(MOTOR_B_IN4, 0);
+}
+
+void readGPS() {
+  while (Serial1.available() > 0) {
+    if (gps.encode(Serial1.read())) {
+      // GPS data is processed automatically by TinyGPS++
+    }
+  }
+}
+
+void sendGPSData() {
+  if (gps.location.isValid()) {
+    vehicleStatus = "GPS: " + String(gps.location.lat(), 6) + ", " + String(gps.location.lng(), 6);
+  } else {
+    vehicleStatus = "GPS: No signal";
+  }
+  Serial.println(vehicleStatus);
+}
+
+void testSequence() {
+  vehicleStatus = "Running Test Sequence...";
+  server.send(200, "application/json", "{\"status\":\"OK\", \"message\":\"Test started\"}");
+  
+  // Run test in background
+  moveForward();
+  delay(2000);
+  moveBackward();
+  delay(2000);
+  turnLeft();
+  delay(2000);
+  turnRight();
+  delay(2000);
+  stopMotors();
+  
+  vehicleStatus = "Test Complete!";
+  Serial.println(vehicleStatus);
+}
